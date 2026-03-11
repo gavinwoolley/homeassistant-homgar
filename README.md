@@ -1,12 +1,13 @@
 # HomGar Cloud integration for Home Assistant
 
-Unofficial Home Assistant component for HomGar Cloud, supporting RF soil moisture and rain sensors via the HomGar cloud API.
+Unofficial Home Assistant component for HomGar Cloud, supporting RF soil moisture, rain, and irrigation valve control via the HomGar cloud API.
 
 ---
 
 ## Compatibility
 
 Tested with:
+
 - Hub: `HWG023WBRF-V2`
 - Soil moisture probes:
   - `HCS026FRF` (moisture-only)
@@ -23,6 +24,8 @@ Tested with:
   - `HCS0528ARF`
 - Pool + Ambient temp/humidity:
   - `HCS015ARF+`
+- Irrigation valve hub:
+  - `HTV0540FRF` (multi-zone; zone count detected automatically from device payload)
 
 The integration communicates with the same cloud endpoints as the HomGar app (`region3.homgarus.com`).
 
@@ -47,10 +50,47 @@ The integration communicates with the same cloud endpoints as the HomGar app (`r
   - CO2, temperature, humidity (HCS0530THO)
   - Pool temperature (HCS0528ARF)
   - Pool + ambient temperature and humidity (HCS015ARF+)
-- Attributes:
+  - **Irrigation valve control (HTV0540FRF)**:
+    - One `valve` entity per zone - open/close from the HA UI or automations
+    - One `number` entity per zone - configurable run duration (1-60 minutes, persisted across restarts)
+    - Zone count is detected automatically from the device payload; no hardcoded assumption about 1, 2, 3 or more zones
+    - Immediate state reflection after a command - no waiting for the next poll cycle
+    - State attributes: `duration_seconds`, `state_raw`
+- Attributes (sensors):
   - `rssi_dbm`
   - `battery_status_code`
   - `last_updated` (cloud timestamp)
+
+---
+
+## Irrigation valve usage
+
+Each zone appears as two entities in Home Assistant:
+
+| Entity type | Name example | Purpose |
+| --- | --- | --- |
+| `valve` | `Zone 1` | Open / close the zone |
+| `number` | `Zone 1 Duration` | Default run time in minutes (1–60) |
+
+**Opening a zone:**
+
+Call the `valve.open_valve` service. The zone will run for the duration currently set in the companion `number` entity (default 10 minutes). You can override the duration at service-call time using the `duration` attribute (value in seconds):
+
+```yaml
+service: valve.open_valve
+target:
+  entity_id: valve.my_valve_hub_zone_1
+data:
+  duration: 300   # 5 minutes (seconds)
+```
+
+**Closing a zone:**
+
+```yaml
+service: valve.close_valve
+target:
+  entity_id: valve.my_valve_hub_zone_1
+```
 
 ---
 
@@ -72,32 +112,6 @@ You can quickly add this repository to HACS by clicking the button below:
 ## Configuration
 
 Go to **Settings → Devices & Services → Add Integration** and search for **HomGar Cloud**. Enter your HomGar account credentials (email and area code) to connect.
-
----
-
-## Example manifest.json
-
-Below is the manifest file for this integration (as of version 0.2.6):
-
-```json
-{
-    "domain": "homgar",
-    "name": "HomGar Cloud",
-    "version": "0.2.6",
-    "documentation": "https://github.com/brettmeyerowitz/homeassistant-homgar",
-    "issue_tracker": "https://github.com/brettmeyerowitz/homeassistant-homgar/issues",
-    "requirements": [],
-    "codeowners": [
-        "@brettmeyerowitz"
-    ],
-    "config_flow": true,
-    "iot_class": "cloud_polling",
-    "integration_type": "hub",
-    "loggers": [
-        "custom_components.homgar"
-    ]
-}
-```
 
 ---
 

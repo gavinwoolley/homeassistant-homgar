@@ -20,11 +20,13 @@ from .const import (
     MODEL_POOL,
     MODEL_POOL_PLUS,
     MODEL_DISPLAY_HUB,
+    MODEL_VALVE_HUB,
 )
 from .homgar_api import (
     HomGarClient, HomGarApiError,
     decode_moisture_simple, decode_moisture_full, decode_rain,
     decode_temphum, decode_flowmeter, decode_co2, decode_pool, decode_pool_plus,
+    decode_valve_hub,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -60,14 +62,47 @@ class HomGarCoordinator(DataUpdateCoordinator):
             status_by_mid: dict[int, dict] = {}
             decoded_sensors: dict[str, dict] = {}
 
-            for hub in hubs:
-                mid = hub["mid"]
+            # Build the device list for the batch status call from hubs that have
+            # deviceName and productKey available (i.e. the valve hub and others
+            # that expose these fields).  Fall back to per-hub getDeviceStatus for
+            # any hub that does not have them.
+            batch_devices = [
+                {"deviceName": h["deviceName"], "mid": str(h["mid"]), "productKey": h["productKey"]}
+                for h in hubs
+                if h.get("deviceName") and h.get("productKey")
+            ]
+            fallback_mids = {
+                h["mid"] for h in hubs
+                if not (h.get("deviceName") and h.get("productKey"))
+            }
+
+            if batch_devices:
+                batch_results = await self._client.get_multiple_device_status(batch_devices)
+                # multipleDeviceStatus returns a list; index by mid for lookup below
+                for result in batch_results:
+                    result_mid = int(result.get("mid", 0))
+                    status_by_mid[result_mid] = result
+                _LOGGER.debug("Batch status fetched for %d devices", len(batch_devices))
+
+            for mid in fallback_mids:
                 status = await self._client.get_device_status(mid)
                 status_by_mid[mid] = status
+                _LOGGER.debug("Fallback status fetched for mid=%s", mid)
 
-                _LOGGER.debug("Fetched status for mid=%s: %s", mid, status)
+            for hub in hubs:
+                mid = hub["mid"]
+                status = status_by_mid.get(mid, {})
 
-                sub_status = {s["id"]: s for s in status.get("subDeviceStatus", [])}
+                _LOGGER.debug("Processing status for mid=%s: %s", mid, status)
+
+                # multipleDeviceStatus returns a 'status' list; getDeviceStatus returns
+                # 'subDeviceStatus'. Support both so the fallback path still works.
+                raw_status_list = (
+                    status.get("subDeviceStatus")
+                    or status.get("status")
+                    or []
+                )
+                sub_status = {s["id"]: s for s in raw_status_list if s.get("id")}
 
                 # Map addr -> subDevice
                 addr_map = {sd["addr"]: sd for sd in hub.get("subDevices", [])}
@@ -113,6 +148,8 @@ class HomGarCoordinator(DataUpdateCoordinator):
                             elif model == MODEL_DISPLAY_HUB:
                                 from .homgar_api import decode_hws019wrf_v2
                                 decoded = decode_hws019wrf_v2(raw_value)
+                            elif model == MODEL_VALVE_HUB:
+                                decoded = decode_valve_hub(raw_value)
                             else:
                                 # Store raw data for unknown models so users can report it
                                 decoded = {
@@ -167,6 +204,8 @@ class HomGarCoordinator(DataUpdateCoordinator):
                         "model": sub.get("model"),
                         "raw_status": s,
                         "data": decoded,
+                        "device_name": hub.get("deviceName"),
+                        "product_key": hub.get("productKey"),
                     }
 
                     _LOGGER.debug("Sensor entity key=%s info=%s", sensor_key, decoded_sensors[sensor_key])

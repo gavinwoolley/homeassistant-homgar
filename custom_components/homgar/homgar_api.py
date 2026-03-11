@@ -187,7 +187,85 @@ class HomGarClient:
         if data.get("code") != 0:
             raise HomGarApiError(f"getDeviceStatus failed: {data}")
         return data.get("data", {})
-    
+
+    async def get_multiple_device_status(self, devices: list[dict]) -> list[dict]:
+        """
+        Fetch status for multiple devices in a single call.
+
+        Each entry in devices should be a dict with keys:
+            deviceName, mid (str), productKey
+
+        Returns the list of device status dicts from the API response.
+        This is more efficient than calling get_device_status per hub.
+        """
+        await self.ensure_logged_in()
+        url = f"{self._base_url}/app/device/multipleDeviceStatus"
+        payload = {"devices": devices}
+        _LOGGER.debug("API call: get_multiple_device_status devices=%s", devices)
+        async with self._session.post(url, json=payload, headers=self._auth_headers()) as resp:
+            if resp.status != 200:
+                raise HomGarApiError(f"multipleDeviceStatus HTTP {resp.status}")
+            data = await resp.json()
+        _LOGGER.debug("API response: get_multiple_device_status data=%s", data)
+        if data.get("code") != 0:
+            raise HomGarApiError(f"multipleDeviceStatus failed: {data}")
+        return data.get("data", [])
+
+    async def control_work_mode(
+        self,
+        mid: int,
+        addr: int,
+        device_name: str,
+        product_key: str,
+        port: int,
+        mode: int,
+        duration: int,
+    ) -> dict:
+        """
+        Control a valve zone via the confirmed controlWorkMode endpoint.
+
+        Args:
+            mid:          Hub mid (device ID)
+            addr:         Sub-device address
+            device_name:  Hub deviceName field (e.g. "MAC-885721174638")
+            product_key:  Hub productKey field (e.g. "a3QrDxYPTM2")
+            port:         Zone number (1-based)
+            mode:         1 = open, 0 = close
+            duration:     Run time in seconds (ignored / set to 0 when closing)
+
+        Returns the full API response data dict on success.
+        """
+        await self.ensure_logged_in()
+        url = f"{self._base_url}/app/device/controlWorkMode"
+        payload = {
+            "deviceName": device_name,
+            "productKey": product_key,
+            "mid": str(mid),
+            "addr": addr,
+            "port": port,
+            "mode": mode,
+            "duration": duration,
+            "param": "",
+        }
+        _LOGGER.debug("control_work_mode url=%s payload=%s", url, payload)
+        async with self._session.post(url, json=payload, headers=self._auth_headers()) as resp:
+            if resp.status != 200:
+                raise HomGarApiError(f"controlWorkMode HTTP {resp.status}")
+            data = await resp.json()
+        _LOGGER.debug("control_work_mode response: %s", data)
+        code = data.get("code")
+        if code == 4:
+            # Code 4 = device already in requested state or transitioning - not fatal.
+            _LOGGER.warning(
+                "controlWorkMode returned code 4 (busy/already in state), "
+                "treating as non-fatal: %s", data
+            )
+        elif code != 0:
+            raise HomGarApiError(f"controlWorkMode failed: {data}")
+        # Return the updated state payload string so callers can apply it immediately
+        # without waiting for the next poll cycle (which may return stale cached data).
+        return data.get("data", {}).get("state")
+
     # --- Payload decoding helpers ---
 
 def _parse_homgar_payload(raw: str) -> list[int]:
@@ -507,3 +585,179 @@ def decode_pool_plus(raw: str) -> dict:
         "humidity_high": humidity_high,
         "raw_bytes": b,
     }
+
+
+
+# ---------------------------------------------------------------------------
+# HTV0540FRF - irrigation valve hub
+# Uses an 11# prefixed TLV-encoded payload distinct from the 10# sensor format.
+# ---------------------------------------------------------------------------
+
+# Type byte -> value width in bytes.  0x20 is a flag with no following value bytes.
+_TLV_TYPE_WIDTHS: dict[int, int] = {
+    0xD8: 1,
+    0xDC: 1,
+    0xB7: 4,
+    0xAD: 2,
+    0xE1: 2,
+    0xC4: 1,
+    0xC5: 1,
+    0xC6: 1,
+    0x20: 0,
+}
+
+# DP IDs for zone state and duration (confirmed via payload capture)
+# Zone N state DP   = _DP_HUB_STATE + N  (0x19 = zone 1, 0x1A = zone 2, ...)
+# Zone N duration DP = _DP_BASE_DURATION + N (0x25 = zone 1, 0x26 = zone 2, ...)
+_DP_HUB_STATE = 0x18
+_DP_BASE_DURATION = 0x24  # zone N duration DP = 0x24 + N
+
+# Value written to the state DP when a zone is open (observed: 0x21)
+_ZONE_OPEN_STATE_BYTE = 0x21
+
+
+def _parse_tlv_payload(raw: str) -> dict[int, tuple[int, int | None]]:
+    """
+    Parse a HomGar TLV payload with an '11#' prefix.
+
+    Returns a dict mapping dp_id -> (type_byte, value_int).
+    For flag-type DPs (type 0x20, zero-width) value_int is None.
+    Big-endian byte order is used for multi-byte values except for the
+    zone duration DPs (0x25/26/27) which are little-endian - the caller
+    is responsible for endian interpretation.
+    """
+    if not raw:
+        raise ValueError("Empty payload")
+    # Strip frame counter prefix: '11#' (or '10#' for other devices)
+    if "#" in raw:
+        raw = raw.split("#", 1)[1]
+
+    if len(raw) % 2 != 0:
+        raise ValueError(f"Odd-length hex payload: {raw!r}")
+
+    data = bytes.fromhex(raw)
+    result: dict[int, tuple[int, int | None]] = {}
+    i = 0
+
+    while i < len(data):
+        dp = data[i]
+        if i + 1 >= len(data):
+            break
+        type_byte = data[i + 1]
+        if type_byte not in _TLV_TYPE_WIDTHS:
+            # Unknown type - advance one byte and try to resync
+            i += 1
+            continue
+        width = _TLV_TYPE_WIDTHS[type_byte]
+        if i + 2 + width > len(data):
+            break
+        value_bytes = data[i + 2: i + 2 + width]
+        value_int = int.from_bytes(value_bytes, "big") if width > 0 else None
+        result[dp] = (type_byte, value_int, value_bytes)  # type: ignore[assignment]
+        i += 2 + width
+
+    return result  # type: ignore[return-value]
+
+
+def decode_valve_hub(raw: str) -> dict:
+    """
+    Decode an irrigation valve hub TLV payload (e.g. HTV0540FRF).
+
+    Confirmed DP map (derived from live payload capture):
+      0x18      hub online state     DC  1-byte  0x01 = online
+      0x18+N    zone N open state    D8  1-byte  0x00 = closed, non-zero = open
+      0x24+N    zone N run duration  AD  2-byte  little-endian seconds
+
+    Zone state DPs are detected dynamically from the payload so that hubs with
+    any number of zones (1, 2, 3, 4, ...) are handled without code changes.
+    """
+    tlv = _parse_tlv_payload(raw)
+
+    def get_val(dp: int) -> int | None:
+        entry = tlv.get(dp)
+        return entry[1] if entry else None  # type: ignore[index]
+
+    def get_raw_bytes(dp: int) -> bytes:
+        entry = tlv.get(dp)
+        return entry[2] if entry else b""  # type: ignore[index]
+
+    hub_state = get_val(_DP_HUB_STATE)
+
+    # Dynamically detect zones: any DP of type 0xD8 (state byte) with
+    # dp > _DP_HUB_STATE follows the pattern zone_num = dp - _DP_HUB_STATE.
+    zones: dict[int, dict] = {}
+    for dp, entry in tlv.items():
+        type_byte = entry[0]
+        if type_byte != 0xD8 or dp <= _DP_HUB_STATE:
+            continue
+        zone_num = dp - _DP_HUB_STATE
+        state_val = entry[1]
+        dur_dp = _DP_BASE_DURATION + zone_num
+        dur_bytes = get_raw_bytes(dur_dp)
+        duration_s = int.from_bytes(dur_bytes, "little") if len(dur_bytes) == 2 else None
+        zones[zone_num] = {
+            # Bit 0 = valve physically open. 0x21 = open, 0x20 = closing/transitional, 0x00 = closed.
+            "open": bool(state_val & 0x01) if state_val is not None else None,
+            "state_raw": state_val,
+            "duration_seconds": duration_s,
+        }
+
+    return {
+        "type": "valve_hub",
+        "hub_online": hub_state == 1,
+        "zones": zones,
+        "raw_tlv": {f"0x{k:02X}": v[1] for k, v in tlv.items()},  # type: ignore[index]
+    }
+
+
+def build_valve_open_command(zone_num: int, duration_seconds: int) -> str:
+    """
+    Build the hex command string to open a single valve zone for a given duration.
+
+    The returned string is the raw hex payload (without any '11#' prefix).
+    It should be passed directly to HomGarClient.send_device_command().
+
+    NOTE: The write endpoint URL has not been confirmed via traffic capture.
+    Test with caution.  See HomGarClient.send_device_command() for details.
+
+    Args:
+        zone_num: zone number (1-based), e.g. 1, 2, 3, 4 ...
+        duration_seconds: how long to run, max 3600 (1 hour)
+    """
+    if zone_num < 1:
+        raise ValueError(f"zone_num must be >= 1, got {zone_num}")
+    if not (1 <= duration_seconds <= 3600):
+        raise ValueError(f"duration_seconds must be 1-3600, got {duration_seconds}")
+
+    state_dp = _DP_HUB_STATE + zone_num
+    dur_dp = _DP_BASE_DURATION + zone_num
+
+    # State byte: D8 type, value = _ZONE_OPEN_STATE_BYTE
+    state_bytes = bytes([state_dp, 0xD8, _ZONE_OPEN_STATE_BYTE])
+
+    # Duration: AD type, 2-byte little-endian seconds
+    dur_le = duration_seconds.to_bytes(2, "little")
+    dur_bytes = bytes([dur_dp, 0xAD]) + dur_le
+
+    return (state_bytes + dur_bytes).hex().upper()
+
+
+def build_valve_close_command(zone_num: int) -> str:
+    """
+    Build the hex command string to close a single valve zone.
+
+    The returned string is the raw hex payload (without any '11#' prefix).
+
+    Args:
+        zone_num: zone number (1-based), e.g. 1, 2, 3, 4 ...
+    """
+    if zone_num < 1:
+        raise ValueError(f"zone_num must be >= 1, got {zone_num}")
+
+    state_dp = _DP_HUB_STATE + zone_num
+    dur_dp = _DP_BASE_DURATION + zone_num
+
+    state_bytes = bytes([state_dp, 0xD8, 0x00])
+    dur_bytes = bytes([dur_dp, 0xAD, 0x00, 0x00])
+
+    return (state_bytes + dur_bytes).hex().upper()
